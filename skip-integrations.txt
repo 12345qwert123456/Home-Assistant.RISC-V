@@ -1,0 +1,4 @@
+# Integrations whose requirements are not installed at build time (one domain
+# per line). Everything not listed here is attempted; failures are skipped
+# automatically by install-requirements.py. Use this file for integrations that
+# are known not to build, or that are too heavy to compile in CI.

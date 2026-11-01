@@ -1,0 +1,5 @@
+# Same pins as home-assistant/docker requirements.txt (database drivers and
+# Brotli that the official image installs on top of Home Assistant Core).
+Brotli==1.2.1
+mysqlclient==2.3.0
+psycopg2==2.9.13

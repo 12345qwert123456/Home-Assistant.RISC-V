@@ -1,0 +1,432 @@
+name: Build Home Assistant for RISC-V 64
+
+# GitHub-hosted jobs stop after 6 hours. Compiling every dependency without a
+# riscv64 wheel under QEMU does not fit in one job, so the build is split:
+#
+#   detect -> plan -> wheels (parallel shards) -> image
+#
+#   plan    resolves the pinned dependency closure natively (no QEMU) and works
+#           out which packages have to be compiled, minus those already in the
+#           "wheels" release from earlier runs.
+#   wheels  one job per shard, in parallel, each with its own 6 h budget. Every
+#           finished wheel is uploaded to the wheels release, even when the job
+#           stops at its deadline, so the work is never lost and the next run
+#           (or the next Home Assistant release, whose pins mostly repeat)
+#           starts where this one stopped.
+#   image   installs the pre-built wheels - no compiler involved - and runs the
+#           smoke tests, including a real Home Assistant start.
+
+on:
+  schedule:
+    - cron: '0 6 * * *'  # daily at 06:00 UTC
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force rebuild even if the release already exists'
+        type: boolean
+        default: false
+      version:
+        description: 'Home Assistant release to build (e.g. 2026.10.4). Empty = latest stable.'
+        type: string
+        default: ''
+      runner:
+        description: 'Runner label. Use a self-hosted riscv64 runner for native builds.'
+        type: string
+        default: 'ubuntu-latest'
+
+env:
+  IMAGE_NAME: home-assistant
+  DOCKERHUB_REPO: ${{ vars.DOCKERHUB_USERNAME }}/home-assistant-riscv64
+  # Packages whose upstream pin is swapped for a pre-built RISE release (see README)
+  RISE_SUBSTITUTES: grpcio
+  # Shards the wheel compilation is split into (parallel jobs)
+  WHEEL_SHARDS: '5'
+
+permissions:
+  contents: write
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      go2rtc: ${{ steps.resolve.outputs.go2rtc }}
+      python: ${{ steps.resolve.outputs.python }}
+      python_image: ${{ steps.resolve.outputs.python_image }}
+      wheels_tag: ${{ steps.resolve.outputs.wheels_tag }}
+      should_build: ${{ steps.check.outputs.should_build }}
+    steps:
+      - name: Resolve version
+        id: resolve
+        run: |
+          if [[ -n "${{ inputs.version }}" ]]; then
+            VERSION="${{ inputs.version }}"
+          else
+            # /releases/latest skips pre-releases, i.e. the monthly betas
+            VERSION=$(curl -sfL https://api.github.com/repos/home-assistant/core/releases/latest | jq -r '.tag_name')
+          fi
+          [[ -n "$VERSION" && "$VERSION" != "null" ]] || { echo "ERROR: cannot resolve version"; exit 1; }
+
+          # Two things upstream pins at that tag and this build has to follow:
+          # the go2rtc version (Dockerfile) and the Python minor (.python-version)
+          DOCKERFILE=$(curl -sfL "https://raw.githubusercontent.com/home-assistant/core/${VERSION}/Dockerfile")
+          GO2RTC=$(echo "$DOCKERFILE" | sed -n 's|.*COPY --from=ghcr.io/alexxit/go2rtc:\([0-9.]*\)@.*|\1|p' | head -n1)
+          [[ -n "$GO2RTC" ]] || { echo "ERROR: cannot resolve go2rtc version"; exit 1; }
+          PYVER=$(curl -sfL "https://raw.githubusercontent.com/home-assistant/core/${VERSION}/.python-version" | cut -d. -f1,2)
+          [[ -n "$PYVER" ]] || { echo "ERROR: cannot resolve Python version"; exit 1; }
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "go2rtc=${GO2RTC}" >> "$GITHUB_OUTPUT"
+          echo "python=${PYVER}" >> "$GITHUB_OUTPUT"
+          echo "python_image=python:${PYVER}-slim-trixie" >> "$GITHUB_OUTPUT"
+          # wheels are specific to the Python minor, shared by all HA releases using it
+          echo "wheels_tag=wheels-py${PYVER/./}-riscv64" >> "$GITHUB_OUTPUT"
+          echo "Resolved Home Assistant ${VERSION}: go2rtc ${GO2RTC}, python:${PYVER}-slim-trixie"
+
+      - name: Check if already built
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ steps.resolve.outputs.version }}"
+
+          if [[ "${{ inputs.force }}" == "true" ]]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "Force build requested"
+            exit 0
+          fi
+
+          EXISTING=$(gh release view "${VERSION}-riscv64" \
+            --repo "${{ github.repository }}" \
+            --json tagName -q '.tagName' 2>/dev/null || echo "")
+
+          if [[ -n "$EXISTING" ]]; then
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "Release ${VERSION}-riscv64 already exists, skipping"
+          else
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "No release for ${VERSION}-riscv64, will build"
+          fi
+
+  plan:
+    needs: detect
+    if: needs.detect.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      has_work: ${{ steps.plan.outputs.has_work }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ needs.detect.outputs.python }}
+
+      - name: Fetch the Home Assistant files the planner reads
+        run: |
+          mkdir ha-src
+          curl -sfL "https://github.com/home-assistant/core/archive/refs/tags/${{ needs.detect.outputs.version }}.tar.gz" \
+            | tar xz -C ha-src --strip-components=1 \
+                --wildcards '*/requirements.txt' '*/requirements_all.txt' '*/homeassistant/package_constraints.txt'
+          pip install uv
+
+      - name: Make sure the wheels release exists and list what it holds
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ needs.detect.outputs.wheels_tag }}"
+          gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1 || \
+            gh release create "$TAG" --repo "${{ github.repository }}" --prerelease --latest=false \
+              --title "Pre-built riscv64 wheels (${TAG})" \
+              --notes "Wheels compiled for linux/riscv64 by CI, used by the image build. Not meant to be downloaded by hand."
+          gh release view "$TAG" --repo "${{ github.repository }}" --json assets -q '.assets[].name' > have.txt
+          echo "$(grep -c '\.whl$' have.txt || true) wheels already built"
+
+      - name: Plan
+        id: plan
+        run: |
+          python plan-wheels.py ha-src skip-integrations.txt plan --have have.txt \
+            --shards "${{ env.WHEEL_SHARDS }}" --python "${{ needs.detect.outputs.python }}"
+          echo "matrix=$(jq -c '[range(0; (.shards | length))]' plan/plan.json)" >> "$GITHUB_OUTPUT"
+          echo "has_work=$(jq -r 'if (.shards | length) > 0 then "true" else "false" end' plan/plan.json)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plan
+          path: plan/plan.json
+
+  wheels:
+    needs: [detect, plan]
+    if: needs.plan.outputs.has_work == 'true'
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: plan
+          path: plan
+
+      - name: Free disk space
+        if: ${{ !contains(inputs.runner || '', 'self-hosted') }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Set up QEMU
+        if: runner.arch != 'RISCV64'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: riscv64
+
+      - uses: docker/setup-buildx-action@v3
+
+      # The toolchain image: shared layers with the final image's builder, so
+      # every shard (and the image job) reuses the same cache.
+      - name: Build the wheel builder
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: wheel_builder
+          platforms: linux/riscv64
+          load: true
+          tags: wheel-builder:ci
+          build-args: |
+            GO2RTC_VERSION=${{ needs.detect.outputs.go2rtc }}
+            PYTHON_IMAGE=${{ needs.detect.outputs.python_image }}
+            RISE_SUBSTITUTES=${{ env.RISE_SUBSTITUTES }}
+            BUILD_JOBS=4
+          cache-from: type=gha,scope=builder
+          cache-to: type=gha,mode=max,scope=builder
+
+      # The deadline leaves time for the hard stop (20 min) and the upload.
+      - name: Compile this shard
+        run: |
+          mkdir -p out
+          docker run --rm --platform linux/riscv64 \
+            -v "$PWD/plan:/plan:ro" -v "$PWD/out:/out" \
+            wheel-builder:ci /plan/plan.json "${{ matrix.shard }}" /out --jobs 2 --deadline-minutes 285
+
+      # Runs even when the compile step was cut short: finished wheels are kept.
+      - name: Upload the wheels to the wheels release
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s nullglob
+          WHEELS=(out/*.whl)
+          echo "${#WHEELS[@]} wheel(s) built"
+          if (( ${#WHEELS[@]} )); then
+            gh release upload "${{ needs.detect.outputs.wheels_tag }}" "${WHEELS[@]}" \
+              --repo "${{ github.repository }}" --clobber
+          fi
+          cat out/BUILD-REPORT.txt || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wheel-report-${{ matrix.shard }}
+          path: |
+            out/BUILD-REPORT.txt
+            out/failures/
+          if-no-files-found: ignore
+
+  image:
+    needs: [detect, plan, wheels]
+    # run when the wheel jobs were skipped (nothing to compile) or succeeded
+    if: >-
+      always() && needs.detect.result == 'success' && needs.plan.result == 'success' &&
+      (needs.wheels.result == 'success' || needs.wheels.result == 'skipped')
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
+    timeout-minutes: 360
+    env:
+      VERSION: ${{ needs.detect.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        if: ${{ !contains(inputs.runner || '', 'self-hosted') }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Download the pre-built wheels
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p wheelhouse
+          gh release download "${{ needs.detect.outputs.wheels_tag }}" --repo "${{ github.repository }}" \
+            --pattern '*.whl' --dir wheelhouse || echo "no wheels in the release"
+          ls wheelhouse | wc -l
+
+      # Anything the wheel jobs deferred (deadline) or failed to build would be
+      # compiled inside the image build, under QEMU, and could blow the time
+      # limit. Fail early instead; re-running the workflow resumes the work.
+      # Packages that failed to build are listed in the shard reports; those
+      # are expected (the installer drops the integrations that need them).
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ needs.detect.outputs.python }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-report-*
+          path: reports
+          merge-multiple: false
+        continue-on-error: true
+
+      - name: Check that the wheelhouse is complete
+        run: |
+          mkdir ha-src && curl -sfL "https://github.com/home-assistant/core/archive/refs/tags/${VERSION}.tar.gz" \
+            | tar xz -C ha-src --strip-components=1 \
+                --wildcards '*/requirements.txt' '*/requirements_all.txt' '*/homeassistant/package_constraints.txt'
+          pip install uv
+          ls wheelhouse > have.txt
+          python plan-wheels.py ha-src skip-integrations.txt plan --have have.txt --shards 1 \
+            --python "${{ needs.detect.outputs.python }}"
+          jq -r '.shards[][]' plan/plan.json | sort > missing.txt
+          # known build failures from this run's shard reports
+          cat reports/*/BUILD-REPORT.txt 2>/dev/null | sed -n 's/^FAILED *\([^ ]*\) .*/\1/p' | sort > failed.txt || true
+          comm -23 missing.txt failed.txt > unexpected.txt
+          echo "missing: $(wc -l < missing.txt), failed to build (expected): $(wc -l < failed.txt)"
+          if [[ -s unexpected.txt ]]; then
+            echo "ERROR: wheels still missing - re-run the workflow to resume compiling them:"; cat unexpected.txt; exit 1
+          fi
+
+      - name: Set up QEMU
+        if: runner.arch != 'RISCV64'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: riscv64
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/riscv64
+          load: true
+          tags: ${{ env.IMAGE_NAME }}:${{ env.VERSION }}-riscv64
+          build-args: |
+            HA_VERSION=${{ env.VERSION }}
+            GO2RTC_VERSION=${{ needs.detect.outputs.go2rtc }}
+            PYTHON_IMAGE=${{ needs.detect.outputs.python_image }}
+            RISE_SUBSTITUTES=${{ env.RISE_SUBSTITUTES }}
+            BUILD_JOBS=4
+          cache-from: type=gha,scope=builder
+          cache-to: type=gha,mode=max,scope=image
+
+      - name: Smoke-test the image
+        run: |
+          IMG="${{ env.IMAGE_NAME }}:${{ env.VERSION }}-riscv64"
+
+          docker inspect "$IMG" --format '{{.Architecture}}' | grep -qx 'riscv64' \
+            || { echo "ERROR: image is not riscv64"; exit 1; }
+
+          # Installed version matches the tag, and the interpreter meets upstream's requirement
+          docker run --rm --platform linux/riscv64 --entrypoint python "$IMG" \
+            -c "import sys, homeassistant.const as c; print(sys.version); print('Home Assistant', c.__version__); assert c.__version__ == '${{ env.VERSION }}'"
+
+          # C extensions that have a slow pure-Python fallback really loaded
+          docker run --rm --platform linux/riscv64 --entrypoint python "$IMG" -c \
+            "import aiohttp, multidict, yarl, propcache, orjson, cryptography.hazmat.bindings._rust, ciso8601, lru, zeroconf, bcrypt, yaml, av, numpy, sqlalchemy.cyextension.collections; print('C extensions ok')"
+
+          # Home Assistant checks the installed version of every manifest
+          # requirement against its pin at runtime; a mismatch makes it try to
+          # install the pinned version and fail. Verify them for default_config.
+          docker run --rm --platform linux/riscv64 --entrypoint python "$IMG" -c \
+            "
+          import asyncio, json, pathlib
+          from importlib.metadata import version
+          from packaging.requirements import Requirement
+          comps = pathlib.Path('/usr/src/homeassistant/homeassistant/components')
+          seen, todo, bad = set(), ['default_config'], []
+          while todo:
+              d = todo.pop()
+              if d in seen: continue
+              seen.add(d)
+              m = json.loads((comps / d / 'manifest.json').read_text())
+              todo += m.get('dependencies', [])
+              for r in map(Requirement, m.get('requirements', [])):
+                  try:
+                      if not r.specifier.contains(version(r.name), prereleases=True): bad.append((d, str(r), version(r.name)))
+                  except Exception as e: bad.append((d, str(r), repr(e)))
+          print(len(seen), 'integrations checked'); assert not bad, bad
+          "
+
+          # The binaries the image ships next to Home Assistant
+          docker run --rm --platform linux/riscv64 --entrypoint sh "$IMG" -c \
+            "go2rtc --version | grep -q riscv64 && ffmpeg -version | head -n1 && nmap --version | sed -n 2p"
+
+          # Swapped pins and left-out integrations, so a lagging RISE index
+          # shows up in the log instead of going unnoticed
+          docker run --rm --platform linux/riscv64 --entrypoint sh "$IMG" -c \
+            "echo '--- substitutes'; cat /usr/share/ha-riscv64/substitutes.txt; echo '--- skipped integrations'; cat /usr/share/ha-riscv64/skipped-integrations.txt"
+
+      - name: Start Home Assistant and wait for the web UI
+        run: |
+          IMG="${{ env.IMAGE_NAME }}:${{ env.VERSION }}-riscv64"
+          mkdir -p "$RUNNER_TEMP/ha-config"
+          docker run -d --name ha --platform linux/riscv64 -p 8123:8123 \
+            -v "$RUNNER_TEMP/ha-config:/config" "$IMG"
+          # Under QEMU the first start (database schema, default_config setup)
+          # takes a long time; 25 minutes is generous. Before onboarding the
+          # root path answers with a redirect, which -f accepts.
+          for i in $(seq 1 150); do
+            if curl -fsS -o /dev/null http://127.0.0.1:8123/; then
+              echo "Home Assistant answered after ~$((i * 10)) s"; docker logs ha 2>&1 | tail -n 30; exit 0
+            fi
+            docker ps -q --filter name=ha | grep -q . || { echo "container exited"; docker logs ha; exit 1; }
+            sleep 10
+          done
+          docker logs ha
+          echo "ERROR: Home Assistant did not answer in time"; exit 1
+
+      - name: Login to Docker Hub
+        if: vars.DOCKERHUB_USERNAME != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Push to Docker Hub
+        if: vars.DOCKERHUB_USERNAME != ''
+        run: |
+          IMG="${{ env.IMAGE_NAME }}:${{ env.VERSION }}-riscv64"
+          docker tag "$IMG" "${{ env.DOCKERHUB_REPO }}:${{ env.VERSION }}"
+          docker tag "$IMG" "${{ env.DOCKERHUB_REPO }}:stable"
+          docker tag "$IMG" "${{ env.DOCKERHUB_REPO }}:latest"
+          docker push "${{ env.DOCKERHUB_REPO }}:${{ env.VERSION }}"
+          docker push "${{ env.DOCKERHUB_REPO }}:stable"
+          docker push "${{ env.DOCKERHUB_REPO }}:latest"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          IMG="${{ env.IMAGE_NAME }}:${{ env.VERSION }}-riscv64"
+          docker run --rm --platform linux/riscv64 --entrypoint sh "$IMG" -c \
+            'echo "Substituted pins:"; cat /usr/share/ha-riscv64/substitutes.txt; echo; echo "Integrations left out at build time:"; cut -f1 /usr/share/ha-riscv64/skipped-integrations.txt | tr "\n" " "' > build-notes.txt || true
+
+          gh release create "${{ env.VERSION }}-riscv64" \
+            --repo "${{ github.repository }}" \
+            --title "Home Assistant ${{ env.VERSION }} for RISC-V 64" \
+            --notes "Unofficial \`linux/riscv64\` build of [Home Assistant Core ${{ env.VERSION }}](https://github.com/home-assistant/core/releases/tag/${{ env.VERSION }}), built from the tagged upstream source without patches.
+
+          **Docker image:**
+          \`\`\`bash
+          docker pull ${{ env.DOCKERHUB_REPO }}:${{ env.VERSION }}
+          \`\`\`
+
+          \`\`\`
+          $(cat build-notes.txt)
+          \`\`\`
+
+          See the [README](https://github.com/${{ github.repository }}#readme) for run instructions and known limitations." || \
+          gh release edit "${{ env.VERSION }}-riscv64" --repo "${{ github.repository }}" --draft=false

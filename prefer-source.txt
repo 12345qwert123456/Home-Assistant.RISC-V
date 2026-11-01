@@ -1,0 +1,8 @@
+# Packages that publish a pure-Python wheel next to compiled ones. Without a
+# riscv64 wheel pip/uv would pick the pure wheel and lose the C speedups, so
+# these are compiled from the sdist instead (see plan-wheels.py).
+sqlalchemy          # recorder database layer (Cython extensions)
+websockets          # frontend websocket frames (C speedups)
+cbor2
+# (charset-normalizer and frozendict were tried: they only build a pure-Python wheel without extra
+#  mypyc/flags, so compiling them gains nothing.)

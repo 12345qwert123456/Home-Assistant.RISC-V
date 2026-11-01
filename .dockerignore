@@ -1,0 +1,12 @@
+.git
+.github
+*.md
+*.tar
+*.tar.gz
+.gitignore
+.gitattributes
+LICENSE
+plan/
+ha-src/
+reports/
+out/

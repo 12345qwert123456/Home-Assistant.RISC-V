@@ -1,0 +1,27 @@
+# Build artifacts
+*.tar
+*.tar.gz
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+
+# Pre-built wheels (CI downloads them here before the image build)
+wheelhouse/*.whl
+
+# CI working directories
+plan/
+ha-src/
+reports/
+out/

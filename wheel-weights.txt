@@ -1,0 +1,17 @@
+# Relative build cost of packages that get compiled (default 1). Only used to
+# spread them evenly over the CI shards in plan-wheels.py; rough guesses are
+# fine. Adjust from the "built ... in N min" lines of a wheel job's log.
+numpy 30          # 25 min on 12 cores under QEMU (meson + C)
+cryptography 30   # Rust
+sqlalchemy 8      # Cython, 7 min on 12 cores
+deebot-client 15  # Rust
+awscrt 15         # C, large
+av 12             # Cython against FFmpeg
+cachebox 6        # Rust
+ormsgpack 6       # Rust
+tibs 6            # Rust
+gazetteer-matcher 6
+aioesphomeapi 5   # Cython
+zeroconf 5        # Cython
+pycryptodome 4
+pycryptodomex 4
