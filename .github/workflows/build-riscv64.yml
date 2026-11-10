@@ -52,6 +52,7 @@ jobs:
       version: ${{ steps.resolve.outputs.version }}
       go2rtc: ${{ steps.resolve.outputs.go2rtc }}
       python: ${{ steps.resolve.outputs.python }}
+      python_full: ${{ steps.resolve.outputs.python_full }}
       python_image: ${{ steps.resolve.outputs.python_image }}
       wheels_tag: ${{ steps.resolve.outputs.wheels_tag }}
       should_build: ${{ steps.check.outputs.should_build }}
@@ -72,12 +73,16 @@ jobs:
           DOCKERFILE=$(curl -sfL "https://raw.githubusercontent.com/home-assistant/core/${VERSION}/Dockerfile")
           GO2RTC=$(echo "$DOCKERFILE" | sed -n 's|.*COPY --from=ghcr.io/alexxit/go2rtc:\([0-9.]*\)@.*|\1|p' | head -n1)
           [[ -n "$GO2RTC" ]] || { echo "ERROR: cannot resolve go2rtc version"; exit 1; }
-          PYVER=$(curl -sfL "https://raw.githubusercontent.com/home-assistant/core/${VERSION}/.python-version" | cut -d. -f1,2)
+          # full version (3.14.9): some pinned packages need a patch level (e.g. >=3.14.2), and
+          # uv resolves against the exact version it is given, so a bare "3.14" is not enough
+          PYFULL=$(curl -sfL "https://raw.githubusercontent.com/home-assistant/core/${VERSION}/.python-version" | tr -d '[:space:]')
+          PYVER=$(echo "$PYFULL" | cut -d. -f1,2)
           [[ -n "$PYVER" ]] || { echo "ERROR: cannot resolve Python version"; exit 1; }
 
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "go2rtc=${GO2RTC}" >> "$GITHUB_OUTPUT"
           echo "python=${PYVER}" >> "$GITHUB_OUTPUT"
+          echo "python_full=${PYFULL}" >> "$GITHUB_OUTPUT"
           echo "python_image=python:${PYVER}-slim-trixie" >> "$GITHUB_OUTPUT"
           # wheels are specific to the Python minor, shared by all HA releases using it
           echo "wheels_tag=wheels-py${PYVER/./}-riscv64" >> "$GITHUB_OUTPUT"
@@ -146,7 +151,7 @@ jobs:
         id: plan
         run: |
           python plan-wheels.py ha-src skip-integrations.txt plan --have have.txt \
-            --shards "${{ env.WHEEL_SHARDS }}" --python "${{ needs.detect.outputs.python }}"
+            --shards "${{ env.WHEEL_SHARDS }}" --python "${{ needs.detect.outputs.python_full }}"
           echo "matrix=$(jq -c '[range(0; (.shards | length))]' plan/plan.json)" >> "$GITHUB_OUTPUT"
           echo "has_work=$(jq -r 'if (.shards | length) > 0 then "true" else "false" end' plan/plan.json)" >> "$GITHUB_OUTPUT"
 
@@ -288,7 +293,7 @@ jobs:
           pip install uv
           ls wheelhouse > have.txt
           python plan-wheels.py ha-src skip-integrations.txt plan --have have.txt --shards 1 \
-            --python "${{ needs.detect.outputs.python }}"
+            --python "${{ needs.detect.outputs.python_full }}"
           jq -r '.shards[][]' plan/plan.json | sort > missing.txt
           # known build failures from this run's shard reports
           cat reports/*/BUILD-REPORT.txt 2>/dev/null | sed -n 's/^FAILED *\([^ ]*\) .*/\1/p' | sort > failed.txt || true
